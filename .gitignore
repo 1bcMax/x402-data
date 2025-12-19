@@ -1,0 +1,13 @@
+# Data files
+data/
+*.json
+!facilitators_addresses.json
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# IDE
+.vscode/
+.idea/
