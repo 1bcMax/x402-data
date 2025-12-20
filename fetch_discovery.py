@@ -42,7 +42,10 @@ def fetch_with_pagination(url, facilitator_name, limit=100, max_retries=3):
                     if isinstance(data, list):
                         items = data
                     elif isinstance(data, dict):
+                        # Try multiple paths: items, resources, data.items (AnySpend format)
                         items = data.get('items', data.get('resources', []))
+                        if not items and 'data' in data and isinstance(data['data'], dict):
+                            items = data['data'].get('items', [])
                     else:
                         items = []
 
