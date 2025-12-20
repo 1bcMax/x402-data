@@ -63,14 +63,63 @@ TESTNET_PATTERNS = [
     'holesky', '-devnet', 'sepolia', 'testnet'
 ]
 
-# Auto-tagging keywords
+# Hosting platform domains to filter out (not serious projects)
+HOSTING_DOMAINS = [
+    '.vercel.app',
+    '.netlify.app',
+    '.render.com',
+    '.onrender.com',
+    '.herokuapp.com',
+    '.railway.app',
+    '.fly.dev',
+    '.replit.dev',
+    '.glitch.me',
+    '.surge.sh',
+    '.pages.dev',      # Cloudflare Pages
+    '.workers.dev',    # Cloudflare Workers
+    '.nx.link',        # Some hosting
+    'localhost',
+]
+
+# Auto-tagging keywords (new categories)
 TAG_KEYWORDS = {
-    'AI': ['ai', 'llm', 'gpt', 'claude', 'gemini', 'ml', 'model', 'chat', 'completion', 'inference'],
-    'Trading': ['trade', 'trading', 'swap', 'dex', 'exchange', 'price', 'market'],
-    'Blockchain': ['blockchain', 'web3', 'nft', 'token', 'wallet', 'contract', 'eth', 'sol'],
-    'Search': ['search', 'query', 'find', 'lookup', 'index'],
-    'Data': ['data', 'api', 'fetch', 'scrape', 'crawl'],
-    'Utility': ['util', 'tool', 'convert', 'format', 'parse'],
+    'ai_agent': [
+        'agent', 'swarm', 'autonomous', 'workflow', 'assistant', 'bot',
+        'eliza', 'virtuals', 'daydreams', 'ai-agent', 'aiagent'
+    ],
+    'llm_inference': [
+        'llm', 'gpt', 'claude', 'gemini', 'inference', 'completion', 'chat',
+        'openai', 'anthropic', 'mistral', 'llama', 'generate'
+    ],
+    'blockchain_data': [
+        'onchain', 'on-chain', 'token-info', 'dex-data', 'chain-data',
+        'blockchain', 'transaction', 'block', 'address', 'balance'
+    ],
+    'trading': [
+        'trade', 'trading', 'swap', 'dex', 'exchange', 'market', 'price',
+        'order', 'quote', 'liquidity'
+    ],
+    'nft': [
+        'nft', 'collectible', 'mint', 'metadata', 'opensea', 'collection'
+    ],
+    'payment': [
+        'payment', 'pay', 'transfer', 'usdc', 'send', 'receive', 'wallet'
+    ],
+    'social_media': [
+        'twitter', 'social', 'tweet', 'post', 'farcaster', 'lens', 'x.com',
+        'analytics', 'follower'
+    ],
+    'developer_tools': [
+        'sdk', 'api', 'developer', 'tool', 'utility', 'webhook', 'rpc',
+        'endpoint', 'integration'
+    ],
+    'content': [
+        'media', 'image', 'video', 'article', 'content', 'generate-image',
+        'text-to', 'image-to'
+    ],
+    'security': [
+        'security', 'risk', 'compliance', 'audit', 'verify', 'kyc', 'aml'
+    ],
 }
 
 # USDC token addresses by network
@@ -107,6 +156,43 @@ def is_testnet(network: str) -> bool:
         return False
     network_lower = network.lower()
     return any(pattern in network_lower for pattern in TESTNET_PATTERNS)
+
+def is_hosting_domain(domain: str) -> bool:
+    """Check if domain is a hosting platform (not a serious project)"""
+    if not domain:
+        return True
+    domain_lower = domain.lower()
+    return any(host in domain_lower for host in HOSTING_DOMAINS)
+
+def get_root_domain(domain: str) -> str:
+    """
+    Extract root domain for scraping.
+    e.g., data-x402.hexens.io -> hexens.io
+          api.lucyos.ai -> lucyos.ai
+          sub.domain.example.com -> example.com
+    """
+    if not domain:
+        return domain
+
+    parts = domain.split('.')
+
+    # Handle special TLDs like .co.uk, .com.au
+    special_tlds = ['co.uk', 'com.au', 'co.nz', 'co.jp', 'com.br']
+    domain_lower = domain.lower()
+
+    for tld in special_tlds:
+        if domain_lower.endswith('.' + tld):
+            # Get the part before the special TLD
+            prefix = domain_lower[:-len(tld)-1]
+            if '.' in prefix:
+                return prefix.split('.')[-1] + '.' + tld
+            return domain
+
+    # For normal domains, return last 2 parts
+    if len(parts) >= 2:
+        return '.'.join(parts[-2:])
+
+    return domain
 
 def filter_accepts(accepts: list) -> list:
     """Filter out testnet payment options from accepts list"""
@@ -153,9 +239,9 @@ def detect_tags(resource_url: str, description: str = '') -> list:
         if any(kw in text for kw in keywords):
             tags.append(tag_name)
 
-    # Default to Utility if no tags detected
+    # Default to 'other' if no tags detected
     if not tags:
-        tags = ['Utility']
+        tags = ['other']
 
     return tags
 
@@ -282,8 +368,15 @@ def fetch_with_pagination(url: str, facilitator_name: str, limit: int = 100, max
                     if not items:
                         return all_items
 
-                    # Filter testnet accepts from each item
+                    # Filter testnet accepts and hosting domains from each item
                     for item in items:
+                        # Skip hosting platform domains (not serious projects)
+                        resource_url = item.get('resource', '')
+                        if resource_url:
+                            parsed = urlparse(resource_url)
+                            if is_hosting_domain(parsed.netloc):
+                                continue
+
                         if 'accepts' in item and item['accepts']:
                             item['accepts'] = filter_accepts(item['accepts'])
                             # Skip items with no mainnet payment options after filtering
@@ -616,11 +709,20 @@ def main():
         print(f"  Accepts: {stats['new_accepts']}")
         print(f"  Errors: {stats['errors']}")
 
-        # 4. Scrape metadata for new origins
+        # 4. Scrape metadata for new origins (use root domain)
         if new_origins:
             print(f"\n[4/5] Scraping metadata for {len(new_origins)} new origins...")
+            scraped_roots = set()  # Track already scraped root domains
             for domain in new_origins:
-                metadata = scrape_origin_metadata(domain)
+                # Use root domain for scraping (e.g., api.lucyos.ai -> lucyos.ai)
+                root_domain = get_root_domain(domain)
+                if root_domain in scraped_roots:
+                    # Copy metadata from already scraped root
+                    continue
+                scraped_roots.add(root_domain)
+
+                print(f"    Scraping {root_domain} (for {domain})...")
+                metadata = scrape_origin_metadata(root_domain)
                 if any(metadata.values()):
                     update_origin_metadata(supabase, domain, metadata)
                 time.sleep(0.5)  # Be nice to servers
