@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 import time
 import os
 import re
-from typing import Optional
+from typing import Optional, List, Dict, Any, Set
 
 # Optional imports with fallbacks
 try:
@@ -127,6 +127,10 @@ USDC_ADDRESSES = {
     'base': '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
     'solana': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
 }
+
+# Traction sync API keys (from environment)
+ALCHEMY_API_KEY = os.environ.get('ALCHEMY_API_KEY')
+HELIUS_API_KEY = os.environ.get('HELIUS_API_KEY')
 
 # ============================================
 # SUPABASE CLIENT
@@ -342,6 +346,8 @@ def fetch_with_pagination(url: str, facilitator_name: str, limit: int = 100, max
     """Fetch data with pagination and rate limit handling"""
     all_items = []
     offset = 0
+    hosting_filtered = 0
+    testnet_filtered = 0
 
     while True:
         paginated_url = f"{url}?offset={offset}&limit={limit}"
@@ -375,19 +381,22 @@ def fetch_with_pagination(url: str, facilitator_name: str, limit: int = 100, max
                         if resource_url:
                             parsed = urlparse(resource_url)
                             if is_hosting_domain(parsed.netloc):
+                                hosting_filtered += 1
                                 continue
 
                         if 'accepts' in item and item['accepts']:
                             item['accepts'] = filter_accepts(item['accepts'])
                             # Skip items with no mainnet payment options after filtering
                             if not item['accepts']:
+                                testnet_filtered += 1
                                 continue
                         elif not item.get('accepts'):
                             # Skip items without any payment options
+                            testnet_filtered += 1
                             continue
                         all_items.append(item)
 
-                    print(f"  {facilitator_name}: fetched {len(all_items)} items...")
+                    print(f"  {facilitator_name}: fetched {len(all_items)} items (filtered: {hosting_filtered} hosting, {testnet_filtered} testnet)")
 
                     if len(items) < limit:
                         return all_items
@@ -480,18 +489,36 @@ def upsert_to_supabase(client: 'Client', items: list) -> tuple:
             # 1. Upsert origin
             origin_id = existing_origins.get(domain)
             if not origin_id:
-                # New origin
+                # New origin - use upsert to handle race conditions
                 origin_data = {
                     'origin': origin,
                     'domain': domain,
                     'resource_count': 1,
                 }
-                result = client.table('origins').insert(origin_data).execute()
-                if result.data:
-                    origin_id = result.data[0]['id']
-                    existing_origins[domain] = origin_id
-                    new_origin_domains.append(domain)
-                    stats['new_origins'] += 1
+                try:
+                    result = client.table('origins').upsert(
+                        origin_data,
+                        on_conflict='origin'
+                    ).execute()
+                    if result.data:
+                        origin_id = result.data[0]['id']
+                        existing_origins[domain] = origin_id
+                        # Check if this was a new insert vs update
+                        if result.data[0].get('created_at') == result.data[0].get('updated_at'):
+                            new_origin_domains.append(domain)
+                            stats['new_origins'] += 1
+                        else:
+                            stats['updated_origins'] += 1
+                except Exception as e:
+                    # If upsert fails, try to fetch existing
+                    try:
+                        existing = client.table('origins').select('id').eq('domain', domain).single().execute()
+                        if existing.data:
+                            origin_id = existing.data['id']
+                            existing_origins[domain] = origin_id
+                            stats['updated_origins'] += 1
+                    except:
+                        pass
             else:
                 stats['updated_origins'] += 1
 
@@ -506,13 +533,20 @@ def upsert_to_supabase(client: 'Client', items: list) -> tuple:
                 'path': path,
                 'type': item.get('type', 'http'),
                 'x402_version': item.get('x402Version', 1),
-                'method': 'POST',
+                'method': item.get('method', 'POST'),  # Read from data, fallback to POST
                 'last_updated': item.get('lastUpdated'),
+                # New fields from facilitator API (item level)
+                'metadata': json.dumps(item.get('metadata')) if item.get('metadata') else None,
+                'input_schema': json.dumps(item.get('inputSchema')) if item.get('inputSchema') else None,
+                'item_output_schema': json.dumps(item.get('outputSchema')) if item.get('outputSchema') else None,
             }
 
-            # Check for description in accepts
+            # Check for description (priority: item metadata > first accept)
             accepts = item.get('accepts', [])
-            if accepts and accepts[0].get('description'):
+            item_metadata = item.get('metadata', {}) or {}
+            if item_metadata.get('description'):
+                resource_data['description'] = item_metadata['description'][:500]
+            elif accepts and accepts[0].get('description'):
                 resource_data['description'] = accepts[0]['description'][:500]
 
             result = client.table('resources').upsert(
@@ -539,6 +573,10 @@ def upsert_to_supabase(client: 'Client', items: list) -> tuple:
                     if 'usdc' in asset_lower or accept.get('asset', '') in USDC_ADDRESSES.values():
                         asset_name = 'USDC'
 
+                # Extract outputSchema fields for queryability
+                output_schema = accept.get('outputSchema', {}) or {}
+                input_schema = output_schema.get('input', {}) or {}
+
                 accept_data = {
                     'resource_id': resource_id,
                     'scheme': accept.get('scheme', 'exact'),
@@ -548,8 +586,12 @@ def upsert_to_supabase(client: 'Client', items: list) -> tuple:
                     'pay_to': accept.get('payTo', ''),
                     'max_amount_required': accept.get('maxAmountRequired', '0'),
                     'max_timeout_seconds': accept.get('maxTimeoutSeconds', 300),
-                    'output_schema': json.dumps(accept.get('outputSchema')) if accept.get('outputSchema') else None,
+                    'output_schema': json.dumps(output_schema) if output_schema else None,
                     'extra': json.dumps(extra) if extra else None,
+                    # New fields from facilitator API
+                    'mime_type': accept.get('mimeType'),
+                    'channel': accept.get('channel') or extra.get('channel'),
+                    'discoverable': input_schema.get('discoverable', True),
                 }
 
                 # Calculate price in USD (USDC has 6 decimals)
@@ -677,6 +719,260 @@ def upload_to_gcs(filepath: str, filename: str, bucket_name: str = "blockrun-dat
         return False
 
 # ============================================
+# TRACTION SYNC (On-Chain USDC Transfers)
+# ============================================
+
+def get_expected_prices(client: 'Client', origin_id: str) -> List[float]:
+    """Get all expected x402 payment prices for this origin."""
+    try:
+        result = client.table("accepts").select(
+            "price_usd, resources!inner(origin_id)"
+        ).eq("resources.origin_id", origin_id).execute()
+
+        prices = []
+        for a in result.data or []:
+            if a.get("price_usd"):
+                try:
+                    prices.append(float(a["price_usd"]))
+                except (ValueError, TypeError):
+                    pass
+        return prices
+    except Exception as e:
+        print(f"    Error fetching expected prices: {e}")
+        return []
+
+
+def is_valid_x402_transfer(amount: float, expected_prices: List[float]) -> bool:
+    """
+    Check if transfer amount matches x402 payment criteria.
+    Price filter: ±10% of expected price
+    """
+    for price in expected_prices:
+        if price <= 0:
+            continue
+        # Allow ±10% tolerance
+        if price * 0.9 <= amount <= price * 1.1:
+            return True
+    return False
+
+
+def get_base_traction(address: str, expected_prices: List[float]) -> Dict[str, Any]:
+    """
+    Get USDC transfers TO an address on Base using Alchemy.
+    Only count transfers matching expected x402 prices (±10%).
+    """
+    if not ALCHEMY_API_KEY:
+        return {"tx_count": 0, "volume": 0.0, "buyers": set(), "last_tx": None}
+
+    try:
+        url = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "alchemy_getAssetTransfers",
+            "params": [{
+                "toAddress": address,
+                "contractAddresses": [USDC_ADDRESSES['base']],
+                "category": ["erc20"],
+                "withMetadata": True
+            }]
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode())
+
+        if "error" in data:
+            print(f"    Alchemy error for {address[:10]}...: {data['error']}")
+            return {"tx_count": 0, "volume": 0.0, "buyers": set(), "last_tx": None}
+
+        transfers = data.get("result", {}).get("transfers", [])
+        if not transfers:
+            return {"tx_count": 0, "volume": 0.0, "buyers": set(), "last_tx": None}
+
+        tx_count = 0
+        volume = 0.0
+        buyers: Set[str] = set()
+        last_tx = None
+
+        for t in transfers:
+            amount = float(t.get("value", 0))
+
+            # Only count if amount matches expected x402 price (±10%)
+            if is_valid_x402_transfer(amount, expected_prices):
+                tx_count += 1
+                volume += amount
+                if t.get("from"):
+                    buyers.add(t["from"])
+                ts = t.get("metadata", {}).get("blockTimestamp")
+                if ts and (not last_tx or ts > last_tx):
+                    last_tx = ts
+
+        return {"tx_count": tx_count, "volume": volume, "buyers": buyers, "last_tx": last_tx}
+
+    except Exception as e:
+        print(f"    Error fetching Base traction for {address[:10]}...: {e}")
+        return {"tx_count": 0, "volume": 0.0, "buyers": set(), "last_tx": None}
+
+
+def get_solana_traction(address: str, expected_prices: List[float]) -> Dict[str, Any]:
+    """
+    Get USDC transfers TO an address on Solana using Helius.
+    Only count transfers matching expected x402 prices (±10%).
+    """
+    if not HELIUS_API_KEY:
+        return {"tx_count": 0, "volume": 0.0, "buyers": set(), "last_tx": None}
+
+    try:
+        url = f"https://api.helius.xyz/v0/addresses/{address}/transactions?api-key={HELIUS_API_KEY}&type=TRANSFER"
+
+        req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            txs = json.loads(response.read().decode())
+
+        if not isinstance(txs, list):
+            return {"tx_count": 0, "volume": 0.0, "buyers": set(), "last_tx": None}
+
+        tx_count = 0
+        volume = 0.0
+        buyers: Set[str] = set()
+        last_tx: Optional[int] = None
+
+        for tx in txs:
+            for transfer in tx.get("tokenTransfers", []):
+                mint = transfer.get("mint", "")
+                # Only count USDC transfers TO this address
+                if mint == USDC_ADDRESSES['solana'] and transfer.get("toUserAccount") == address:
+                    raw_amount = float(transfer.get("tokenAmount", 0))
+
+                    # Only count if amount matches expected x402 price (±10%)
+                    if is_valid_x402_transfer(raw_amount, expected_prices):
+                        tx_count += 1
+                        volume += raw_amount
+                        from_user = transfer.get("fromUserAccount")
+                        if from_user:
+                            buyers.add(from_user)
+                        ts = tx.get("timestamp")
+                        if ts and (last_tx is None or ts > last_tx):
+                            last_tx = ts
+
+        # Convert Unix timestamp to ISO format
+        last_tx_str = None
+        if last_tx:
+            last_tx_str = datetime.fromtimestamp(last_tx, tz=timezone.utc).isoformat()
+
+        return {"tx_count": tx_count, "volume": volume, "buyers": buyers, "last_tx": last_tx_str}
+
+    except Exception as e:
+        print(f"    Error fetching Solana traction for {address[:10]}...: {e}")
+        return {"tx_count": 0, "volume": 0.0, "buyers": set(), "last_tx": None}
+
+
+def sync_traction_for_all_origins(client: 'Client'):
+    """
+    Sync on-chain traction data for all origins.
+    Only counts USDC transfers matching expected x402 prices (±10%).
+    """
+    print("\n[Traction] Syncing on-chain USDC transfer data...")
+    print(f"  Alchemy API: {'configured' if ALCHEMY_API_KEY else 'NOT SET'}")
+    print(f"  Helius API: {'configured' if HELIUS_API_KEY else 'NOT SET'}")
+
+    if not ALCHEMY_API_KEY and not HELIUS_API_KEY:
+        print("  Skipping traction sync - no API keys configured")
+        return
+
+    # Get all origins
+    try:
+        result = client.table("origins").select("id, domain").execute()
+        origins = result.data or []
+    except Exception as e:
+        print(f"  Error fetching origins: {e}")
+        return
+
+    print(f"  Processing {len(origins)} origins...")
+
+    updated_count = 0
+    skipped_count = 0
+
+    for origin in origins:
+        origin_id = origin["id"]
+        domain = origin["domain"]
+
+        # Get expected prices for this origin
+        expected_prices = get_expected_prices(client, origin_id)
+        if not expected_prices:
+            skipped_count += 1
+            continue
+
+        total_tx = 0
+        total_vol = 0.0
+        all_buyers: Set[str] = set()
+        last_tx: Optional[str] = None
+
+        # Get Base traction
+        if ALCHEMY_API_KEY:
+            try:
+                base_accepts = client.table("accepts").select(
+                    "pay_to, resources!inner(origin_id)"
+                ).eq("resources.origin_id", origin_id).eq("network", "base").execute()
+
+                addresses = list(set(a["pay_to"] for a in (base_accepts.data or []) if a.get("pay_to")))
+                for addr in addresses:
+                    t = get_base_traction(addr, expected_prices)
+                    total_tx += t["tx_count"]
+                    total_vol += t["volume"]
+                    all_buyers.update(t["buyers"])
+                    if t["last_tx"] and (not last_tx or t["last_tx"] > last_tx):
+                        last_tx = t["last_tx"]
+            except Exception as e:
+                print(f"    Error processing Base accepts for {domain}: {e}")
+
+        # Get Solana traction
+        if HELIUS_API_KEY:
+            try:
+                sol_accepts = client.table("accepts").select(
+                    "pay_to, resources!inner(origin_id)"
+                ).eq("resources.origin_id", origin_id).eq("network", "solana").execute()
+
+                addresses = list(set(a["pay_to"] for a in (sol_accepts.data or []) if a.get("pay_to")))
+                for addr in addresses:
+                    t = get_solana_traction(addr, expected_prices)
+                    total_tx += t["tx_count"]
+                    total_vol += t["volume"]
+                    all_buyers.update(t["buyers"])
+                    if t["last_tx"] and (not last_tx or t["last_tx"] > last_tx):
+                        last_tx = t["last_tx"]
+            except Exception as e:
+                print(f"    Error processing Solana accepts for {domain}: {e}")
+
+        # Update origin if there's any traction
+        if total_tx > 0:
+            try:
+                update_data = {
+                    "total_transactions": total_tx,
+                    "total_volume_usd": float(total_vol),
+                    "unique_buyers": len(all_buyers),
+                    "last_transaction_at": last_tx,
+                    "traction_updated_at": datetime.now(timezone.utc).isoformat()
+                }
+                client.table("origins").update(update_data).eq("id", origin_id).execute()
+                print(f"    {domain}: {total_tx} tx, ${total_vol:.2f} vol, {len(all_buyers)} buyers")
+                updated_count += 1
+            except Exception as e:
+                print(f"    Error updating {domain}: {e}")
+        else:
+            skipped_count += 1
+
+    print(f"\n  Traction sync complete: {updated_count} updated, {skipped_count} skipped")
+
+
+# ============================================
 # MAIN
 # ============================================
 
@@ -732,6 +1028,11 @@ def main():
         # 5. Record sync history
         print("\n[5/5] Recording sync history...")
         record_sync_history(supabase, started_at, stats)
+
+        # 6. Sync on-chain traction data (if API keys configured)
+        if ALCHEMY_API_KEY or HELIUS_API_KEY:
+            print("\n[6/6] Syncing on-chain traction data...")
+            sync_traction_for_all_origins(supabase)
 
     else:
         print("\n[3/5] Supabase not configured, saving locally...")

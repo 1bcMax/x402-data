@@ -2,6 +2,50 @@
 
 This is the primary data pipeline for BlockRun. It collects x402 service discovery data from all facilitators and syncs it to Supabase.
 
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                         DATA FLOW                                     │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  6 Facilitators ──► fetch-x402-discovery ──► GCS (raw JSON)          │
+│  (hourly)            (Cloud Run Job)          gs://blockrun-data/     │
+│                                                      │                │
+│                                                      ▼                │
+│                                              blockrun/scripts/        │
+│                                              sync_discovery.py        │
+│                                                      │                │
+│                                                      ▼                │
+│  Alchemy + Helius ──► sync_traction.py ──────► Supabase              │
+│  (on-chain data)      (local script)           (origins, resources,  │
+│                                                 accepts tables)       │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Raw data** is stored in GCS (source of truth).
+**Processed data** is synced to Supabase for website queries.
+
+## Pipeline Jobs
+
+| Job | Schedule | Description | Output |
+|-----|----------|-------------|--------|
+| `fetch-x402-discovery` | Hourly | Fetches from 6 facilitators, filters testnet/hosting | GCS JSON files |
+| `sync_discovery.py` | Manual | Reads GCS files, upserts to Supabase | Supabase tables |
+| `sync_traction.py` | Manual | Fetches on-chain USDC transfers | Supabase origins.total_* |
+
+### GCP Resources
+
+| Resource | Name | Location |
+|----------|------|----------|
+| Cloud Run Job | `fetch-x402-discovery` | us-central1 |
+| Cloud Scheduler | `fetch-x402-hourly` | us-central1 |
+| GCS Bucket | `gs://blockrun-data/discovery/` | - |
+
+### Environment Variables (Cloud Run)
+
+- `GCS_BUCKET=blockrun-data`
+
 ## Overview
 
 ```
@@ -82,13 +126,23 @@ Each facilitator is fetched with pagination (100 items per page) and rate limiti
 
 Remove all testnet payment options from `accepts` array. If an item has no mainnet payment options left, it's excluded entirely.
 
-**Filtered patterns:**
+**Filtered testnet patterns** (see `TESTNET_PATTERNS` in fetch_discovery.py):
 - `*-sepolia` (e.g., base-sepolia)
 - `*-testnet`
 - `goerli`
 - `mumbai`
 - `holesky`
 - `*-devnet`
+
+### 2.5. Filter Hosting Domains
+
+Skip resources from temporary hosting platforms (not serious production services).
+
+**Filtered hosting domains** (see `HOSTING_DOMAINS` in fetch_discovery.py):
+- `.vercel.app`, `.netlify.app`, `.render.com`, `.onrender.com`
+- `.herokuapp.com`, `.railway.app`, `.fly.dev`, `.replit.dev`
+- `.glitch.me`, `.surge.sh`, `.pages.dev`, `.workers.dev`
+- `.nx.link`, `localhost`
 
 ### 3. Deduplicate Resources
 
@@ -320,21 +374,60 @@ The script has exponential backoff built in. If persistent, increase sleep time 
 ### Origin Scraping Fails
 Some origins may block scraping or have invalid SSL. The script catches all errors and continues. Check logs for `Failed to scrape {domain}`.
 
+## On-Chain Traction Sync
+
+The `sync_traction.py` script fetches USDC transfer data to calculate traction metrics for each origin.
+
+### Data Sources
+| Chain | API | Free Tier |
+|-------|-----|-----------|
+| Base | Alchemy | 300M CUs/month |
+| Solana | Helius | 1M credits/month |
+
+### Metrics Stored (in origins table)
+| Column | Description |
+|--------|-------------|
+| `total_transactions` | Count of USDC transfers to pay_to addresses |
+| `total_volume_usd` | Sum of USDC transferred |
+| `unique_buyers` | Count of distinct sender addresses |
+| `last_transaction_at` | Timestamp of most recent transfer |
+| `traction_updated_at` | When metrics were last synced |
+
+### Running Traction Sync
+```bash
+# Requires ALCHEMY_API_KEY and HELIUS_API_KEY in .env
+source /path/to/venv/bin/activate
+python sync_traction.py
+```
+
 ## Files
 
 | File | Description |
 |------|-------------|
-| `fetch_discovery.py` | Main pipeline script |
+| `fetch_discovery.py` | Main discovery pipeline (Cloud Run job) |
+| `sync_traction.py` | On-chain traction metrics sync |
 | `requirements.txt` | Python dependencies |
-| `Dockerfile` | Container image definition |
-| `README.md` | This documentation |
+| `Dockerfile` | Container image for fetch_discovery.py |
+| `facilitators_addresses.json` | On-chain addresses for BigQuery analysis |
+| `.env` | Local environment variables (not in git) |
 
-## Facilitator Addresses
+## Database Tables
 
-`facilitators_addresses.json` contains on-chain addresses for BigQuery analysis:
-- 92 EVM addresses (Base, Polygon, Arbitrum)
-- 12 Solana addresses
+| Table | Description | Updated By |
+|-------|-------------|------------|
+| `origins` | Domain-level service records | fetch_discovery.py, sync_traction.py |
+| `resources` | Individual API endpoints | fetch_discovery.py |
+| `accepts` | Payment options (network, price, pay_to) | fetch_discovery.py |
+| `tags` | Categories for filtering | Manual seed |
+| `resource_tags` | Many-to-many resource↔tag | fetch_discovery.py |
+| `sync_history` | Audit log of sync runs | fetch_discovery.py |
+| `discovery_events` | Historical discovery snapshots | (optional) |
 
-## Legacy
+## Supabase Project
 
-The TypeScript sync script at `blockrun/scripts/sync-gcs.ts` is deprecated. It synced from a GCS bucket intermediary. The new Python pipeline goes directly from facilitators to Supabase.
+| Field | Value |
+|-------|-------|
+| Project ID | `fipgpddebmfytowkurvb` |
+| URL | `https://fipgpddebmfytowkurvb.supabase.co` |
+| Region | - |
+| Schema | See `blockrun/supabase/schema.sql` |
