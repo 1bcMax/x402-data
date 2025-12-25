@@ -249,6 +249,33 @@ def detect_tags(resource_url: str, description: str = '') -> list:
 
     return tags
 
+
+def extract_v2_metadata(item: dict) -> dict:
+    """
+    Extract x402 v2 Bazaar metadata fields from facilitator response.
+
+    These fields are part of the Bazaar discovery extension in x402 v2,
+    providing richer metadata for service discovery and documentation.
+
+    Returns dict with:
+    - example_input: Example request data (from metadata.input)
+    - example_output: Example response data (from metadata.output)
+    - input_schema_v2: JSON Schema for input validation (from metadata.inputSchema)
+    - output_schema_v2: JSON Schema for output (from metadata.outputSchema)
+    - self_reported_category: Service category from Bazaar extension
+    - self_reported_tags: Service tags array from Bazaar extension
+    """
+    metadata = item.get('metadata', {}) or {}
+
+    return {
+        'example_input': metadata.get('input'),
+        'example_output': metadata.get('output'),
+        'input_schema_v2': metadata.get('inputSchema'),
+        'output_schema_v2': metadata.get('outputSchema'),
+        'self_reported_category': item.get('category') or metadata.get('category'),
+        'self_reported_tags': item.get('tags') or metadata.get('tags'),
+    }
+
 # ============================================
 # ORIGIN METADATA SCRAPER
 # ============================================
@@ -527,6 +554,9 @@ def upsert_to_supabase(client: 'Client', items: list) -> tuple:
                 continue
 
             # 2. Upsert resource
+            # Extract v2 Bazaar metadata
+            v2_meta = extract_v2_metadata(item)
+
             resource_data = {
                 'origin_id': origin_id,
                 'resource': resource_url,
@@ -535,10 +565,17 @@ def upsert_to_supabase(client: 'Client', items: list) -> tuple:
                 'x402_version': item.get('x402Version', 1),
                 'method': item.get('method', 'POST'),  # Read from data, fallback to POST
                 'last_updated': item.get('lastUpdated'),
-                # New fields from facilitator API (item level)
+                # Legacy fields from facilitator API (item level)
                 'metadata': json.dumps(item.get('metadata')) if item.get('metadata') else None,
                 'input_schema': json.dumps(item.get('inputSchema')) if item.get('inputSchema') else None,
                 'item_output_schema': json.dumps(item.get('outputSchema')) if item.get('outputSchema') else None,
+                # x402 v2 Bazaar metadata fields
+                'example_input': json.dumps(v2_meta['example_input']) if v2_meta.get('example_input') else None,
+                'example_output': json.dumps(v2_meta['example_output']) if v2_meta.get('example_output') else None,
+                'input_schema_v2': json.dumps(v2_meta['input_schema_v2']) if v2_meta.get('input_schema_v2') else None,
+                'output_schema_v2': json.dumps(v2_meta['output_schema_v2']) if v2_meta.get('output_schema_v2') else None,
+                'self_reported_category': v2_meta.get('self_reported_category'),
+                'self_reported_tags': v2_meta.get('self_reported_tags'),  # Already an array
             }
 
             # Check for description (priority: item metadata > first accept)
