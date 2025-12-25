@@ -830,7 +830,7 @@ def get_solana_traction(address: str, expected_prices: List[float]) -> Dict[str,
         return {"tx_count": 0, "volume": 0.0, "buyers": set(), "last_tx": None}
 
     try:
-        url = f"https://api.helius.xyz/v0/addresses/{address}/transactions?api-key={HELIUS_API_KEY}&type=TRANSFER"
+        url = f"https://api-mainnet.helius-rpc.com/v0/addresses/{address}/transactions/?api-key={HELIUS_API_KEY}"
 
         req = urllib.request.Request(url, headers={'Accept': 'application/json'})
         with urllib.request.urlopen(req, timeout=30) as response:
